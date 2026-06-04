@@ -25,12 +25,15 @@ import io
 import json
 import os
 import random
+import re
 import smtplib
 import ssl
 import string
 import threading
 import time
 import webbrowser
+import zipfile
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.utils import formataddr
@@ -69,23 +72,24 @@ def normalize_header(h):
     return h.strip().lower().replace(" ", "_").replace("-", "_")
 
 
-def parse_csv(raw_bytes):
-    """Parse uploaded CSV bytes -> (columns, rows). Rows are dicts keyed by
-    normalized headers. Adds a derived first_name if a name column exists."""
-    text = raw_bytes.decode("utf-8-sig", errors="replace")
-    reader = csv.reader(io.StringIO(text))
-    rows = list(reader)
+def rows_to_table(rows):
+    """Turn a list of rows (first row = header) into (columns, list-of-dicts).
+    Adds a derived first_name if only a full-name column exists."""
+    # Drop leading fully-blank rows (Excel exports sometimes have them).
+    while rows and not any((c or "").strip() for c in rows[0]):
+        rows = rows[1:]
     if not rows:
         return [], []
 
     headers = [normalize_header(h) for h in rows[0]]
     data = []
     for r in rows[1:]:
-        if not any(cell.strip() for cell in r):
+        if not any((cell or "").strip() for cell in r):
             continue
         record = {}
         for i, h in enumerate(headers):
-            record[h] = r[i].strip() if i < len(r) else ""
+            cell = r[i] if i < len(r) and r[i] is not None else ""
+            record[h] = str(cell).strip()
         data.append(record)
 
     name_source = None
@@ -104,6 +108,76 @@ def parse_csv(raw_bytes):
             seen.add(h)
             columns.append(h)
     return columns, data
+
+
+def parse_csv(raw_bytes):
+    """Parse uploaded CSV bytes -> (columns, rows)."""
+    text = raw_bytes.decode("utf-8-sig", errors="replace")
+    rows = list(csv.reader(io.StringIO(text)))
+    return rows_to_table(rows)
+
+
+def _col_index(letters):
+    """'A' -> 0, 'B' -> 1, ... 'AA' -> 26."""
+    n = 0
+    for ch in letters:
+        n = n * 26 + (ord(ch) - ord("A") + 1)
+    return n - 1
+
+
+def parse_xlsx(raw_bytes):
+    """Parse an Excel .xlsx file -> (columns, rows), using only the standard
+    library (an .xlsx is just a zip of XML)."""
+    NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    z = zipfile.ZipFile(io.BytesIO(raw_bytes))
+    names = z.namelist()
+
+    shared = []
+    if "xl/sharedStrings.xml" in names:
+        root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+        for si in root.findall(f"{NS}si"):
+            shared.append("".join(si.itertext()))
+
+    sheet = "xl/worksheets/sheet1.xml"
+    if sheet not in names:
+        cand = sorted(n for n in names if n.startswith("xl/worksheets/") and n.endswith(".xml"))
+        if not cand:
+            return [], []
+        sheet = cand[0]
+
+    root = ET.fromstring(z.read(sheet))
+    out_rows = []
+    for row in root.iter(f"{NS}row"):
+        cells, maxcol = {}, -1
+        for c in row.findall(f"{NS}c"):
+            ref = c.get("r", "")
+            m = re.match(r"[A-Z]+", ref)
+            col = _col_index(m.group()) if m else (max(cells) + 1 if cells else 0)
+            t = c.get("t")
+            v = c.find(f"{NS}v")
+            isn = c.find(f"{NS}is")
+            if t == "s" and v is not None:
+                try:
+                    val = shared[int(v.text)]
+                except (ValueError, IndexError):
+                    val = ""
+            elif t == "inlineStr" and isn is not None:
+                val = "".join(isn.itertext())
+            elif v is not None:
+                val = v.text or ""
+            else:
+                val = ""
+            cells[col] = val
+            maxcol = max(maxcol, col)
+        out_rows.append([cells.get(i, "") for i in range(maxcol + 1)])
+    return rows_to_table(out_rows)
+
+
+def parse_upload(raw_bytes):
+    """Auto-detect CSV vs Excel and parse accordingly."""
+    if raw_bytes[:2] == b"PK":  # .xlsx files are zip archives -> start with 'PK'
+        return parse_xlsx(raw_bytes)
+    return parse_csv(raw_bytes)
 
 
 def code_ok(cfg):
@@ -237,7 +311,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/upload":
             try:
-                columns, rows = parse_csv(raw)
+                columns, rows = parse_upload(raw)
                 self._send(200, json.dumps({"columns": columns, "rows": rows}))
             except Exception as e:
                 self._send(400, json.dumps({"error": str(e)}))
@@ -366,8 +440,9 @@ HTML = r"""<!DOCTYPE html>
 
   <div class="card">
     <h2><span class="step">2</span>Upload your leads</h2>
-    <p class="hint">The CSV list you were sent. Pick which column holds the email address.</p>
-    <input id="file" type="file" accept=".csv">
+    <p class="hint">The lead list you were sent &mdash; a CSV or Excel (.xlsx) file.
+      Pick which column holds the email address.</p>
+    <input id="file" type="file" accept=".csv,.xlsx">
     <div id="uploadMsg" class="hint"></div>
     <label style="margin-top:14px">Email address column</label>
     <select id="emailCol"></select>
