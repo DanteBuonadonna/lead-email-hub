@@ -215,19 +215,30 @@ def send_worker(sid, cfg):
                 JOBS[sid]["failed"] += 1
             JOBS[sid]["log"].append({"to": to, "status": status, "detail": detail})
 
+    def finish_fatal(detail):
+        log("(error)", "fatal", detail)
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(["email", "status", "detail"])
+        w.writerow(["(none)", "fatal", detail])
+        with JOBS_LOCK:
+            JOBS[sid]["results_csv"] = out.getvalue()
+            JOBS[sid]["running"], JOBS[sid]["done"] = False, True
+
     try:
         context = ssl.create_default_context()
         server = smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=30)
         server.login(gmail, app_password)
     except smtplib.SMTPAuthenticationError:
-        log("(login)", "fatal", "Gmail rejected the login. Check the address and the 16-char App Password.")
-        with JOBS_LOCK:
-            JOBS[sid]["running"], JOBS[sid]["done"] = False, True
+        finish_fatal("Gmail rejected the login. Check the address and the 16-char App Password.")
+        return
+    except OSError as e:
+        finish_fatal(f"Could not reach Gmail's mail server ({e}). If this is hosted on a free "
+                     "plan, the host is likely blocking email (SMTP) ports — upgrade the host "
+                     "to a paid instance, or run the hub locally.")
         return
     except Exception as e:
-        log("(connect)", "fatal", f"Could not connect to Gmail: {e}")
-        with JOBS_LOCK:
-            JOBS[sid]["running"], JOBS[sid]["done"] = False, True
+        finish_fatal(f"Could not connect to Gmail: {e}")
         return
 
     for i, item in enumerate(to_send):
@@ -366,14 +377,15 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Lead Email Hub</title>
+<title>LeadForge — Email Hub</title>
 <style>
-  :root { --b:#2563eb; --bg:#f6f7f9; --line:#e3e6ea; --ok:#16a34a; --bad:#dc2626; --muted:#6b7280; }
+  :root { --b:#ea7317; --bg:#f6f7f9; --line:#e3e6ea; --ok:#16a34a; --bad:#dc2626; --muted:#6b7280; }
   * { box-sizing:border-box; }
   body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
          margin:0; background:var(--bg); color:#111827; }
-  header { background:#111827; color:#fff; padding:18px 24px; }
-  header h1 { margin:0; font-size:20px; }
+  header { background:#1f2937; color:#fff; padding:18px 24px; border-bottom:3px solid var(--b); }
+  header h1 { margin:0; font-size:24px; letter-spacing:.3px; }
+  header h1 span { color:var(--b); }
   header p { margin:4px 0 0; color:#9ca3af; font-size:13px; }
   .wrap { max-width:860px; margin:0 auto; padding:24px 20px 80px; }
   .card { background:#fff; border:1px solid var(--line); border-radius:12px; padding:20px 22px; margin-bottom:18px; }
@@ -412,7 +424,7 @@ HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>Lead Email Hub</h1>
+  <h1>Lead<span>Forge</span></h1>
   <p>Send personalized emails to your leads &mdash; straight from your own Gmail.</p>
 </header>
 <div class="wrap">
